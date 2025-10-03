@@ -1,95 +1,110 @@
 """
-title: Ask Wiki
+title: Outline Wiki Retrieval
 author: JECT
 date: 2025-10-03
 version: 1.0
 license: MIT
-description: A pipeline to query Outline (wiki) and retrieve answers from collections and documents.
+description: A pipeline to query an Outline wiki (e.g., wiki.ject.fr) and return relevant documents.
 requirements: requests
 """
 
-import os
-import requests
 from typing import List, Union, Generator, Iterator
+from pydantic import BaseModel, Field
+import requests
+import os
+from logging import getLogger
+
+logger = getLogger(__name__)
+logger.setLevel("DEBUG")
 
 
 class Pipeline:
+    class Valves(BaseModel):
+        OUTLINE_API_BASE: str = Field(
+            default=os.getenv("OUTLINE_API_BASE", "https://wiki.ject.fr/api"),
+            description="Base URL for Outline API",
+        )
+        OUTLINE_API_TOKEN: str = Field(
+            default=os.getenv("OUTLINE_API_TOKEN", ""),
+            description="API token for Outline",
+        )
+        WORD_LIMIT: int = Field(default=500, description="Limit words per document excerpt")
+
     def __init__(self):
-        self.api_base = None
-        self.api_token = None
+        self.name = "Outline Wiki Pipeline"
+        self.valves = self.Valves(
+            **{k: os.getenv(k, v.default) for k, v in self.Valves.model_fields.items()}
+        )
 
     async def on_startup(self):
-        # Called when pipeline starts
-        self.api_base = os.getenv("OUTLINE_API_BASE", "https://wiki.ject.fr/api")
-        self.api_token = os.getenv("OUTLINE_API_TOKEN", "")
+        logger.debug(f"on_startup:{self.name}")
 
     async def on_shutdown(self):
-        # Called when pipeline stops
-        self.api_base = None
-        self.api_token = None
+        logger.debug(f"on_shutdown:{self.name}")
 
     def _headers(self):
-        return {"Authorization": f"Bearer {self.api_token}"}
+        return {"Authorization": f"Bearer {self.valves.OUTLINE_API_TOKEN}"}
 
     def pipe(
-        self, user_message: str, model_id: str, messages: List[dict], body: dict
+        self,
+        user_message: str,
+        model_id: str,
+        messages: List[dict],
+        body: dict
     ) -> Union[str, Generator, Iterator]:
         """
-        Main pipeline logic:
-          1. Fetch collections
-          2. Identify relevant collections
-          3. List documents in them
-          4. Retrieve document content
-          5. Return excerpts as an answer
+        Main pipeline logic: search for documents in Outline by query and return excerpts.
         """
+        logger.info(f"User Message: {user_message}")
+        streaming = body.get("stream", False)
+        context = ""
 
         try:
-            # Step 1: get collections
-            url_col = f"{self.api_base}/collections.list"
-            r = requests.post(url_col, headers=self._headers())
-            r.raise_for_status()
-            collections = r.json().get("data", [])
-
-            # Step 2: filter collections
-            query = user_message
-            target_colls = [
-                c for c in collections if query.lower() in c.get("name", "").lower()
-            ]
-            if not target_colls:
-                target_colls = collections
-
-            response_parts = []
-
-            # Step 3 & 4: documents in collections
-            for coll in target_colls[:3]:
-                col_id = coll.get("id", "?")
-                url_docs = f"{self.api_base}/collections.documents"
-                r2 = requests.post(url_docs, headers=self._headers(), json={"id": col_id})
-                r2.raise_for_status()
-                docs = r2.json().get("data", [])
-
-                matching_docs = [
-                    d for d in docs if query.lower() in d.get("title", "").lower()
-                ] or docs[:3]
-
-                for doc in matching_docs:
-                    doc_id = doc.get("id")
-                    doc_title = doc.get("title", "[Untitled]")
-
-                    # Step 5: get content
-                    url_info = f"{self.api_base}/documents.info"
-                    r3 = requests.post(url_info, headers=self._headers(), json={"id": doc_id})
-                    r3.raise_for_status()
-                    doc_data = r3.json().get("data", {})
-
-                    text = doc_data.get("text", "[empty]")[:600]
-                    response_parts.append(f"### {doc_title}\n{text}...\n")
-
-            return (
-                f"📚 Results for query: *{query}*\n\n" + "\n".join(response_parts)
-                if response_parts
-                else f"No documents found for '{query}'."
+            # 1. Search documents in Outline
+            r = requests.post(
+                f"{self.valves.OUTLINE_API_BASE}/documents.search",
+                headers=self._headers(),
+                json={"query": user_message},
             )
+            r.raise_for_status()
+            docs = r.json().get("data", [])
+
+            if not docs:
+                return f"No documents found for '{user_message}'"
+
+            multi_part = False
+            for doc in docs[:3]:  # limit to 3 docs
+                if multi_part and streaming:
+                    yield "---\n"
+
+                doc_id = doc.get("document", {}).get("id")
+                doc_title = doc.get("document", {}).get("title", "[Untitled]")
+
+                # 2. Get document content
+                r = requests.post(
+                    f"{self.valves.OUTLINE_API_BASE}/documents.info",
+                    headers=self._headers(),
+                    json={"id": doc_id},
+                )
+                r.raise_for_status()
+                doc_data = r.json().get("data", {})
+                text = doc_data.get("text", "[empty]")
+
+                excerpt = text.split()[:self.valves.WORD_LIMIT]
+                excerpt_text = " ".join(excerpt) + ("..." if len(excerpt) >= self.valves.WORD_LIMIT else "")
+
+                chunk = f"## {doc_title}\n\n{excerpt_text}\n"
+
+                if streaming:
+                    yield chunk
+                else:
+                    context += chunk + "\n"
+
+                multi_part = True
+
+            if not streaming:
+                return context if context else "No relevant content"
 
         except Exception as e:
-            return f"Error while querying wiki: {e}"
+            logger.error(f"Pipeline error: {e}")
+            return f"Error while querying Outline: {e}"
