@@ -51,13 +51,17 @@ class Pipeline:
         model_id: str,
         messages: List[dict],
         body: dict
-    ) -> Union[str, Generator, Iterator]:
+    ) -> Union[str, Iterator[str]]:
         """
         Main pipeline logic: search for documents in Outline by query and return full Markdown content.
         """
         logger.info(f"User Message: {user_message}")
         streaming = body.get("stream", False)
         context = ""
+
+        # Validate token early to avoid network call without auth
+        if not self.valves.OUTLINE_API_TOKEN:
+            return "Outline API token is missing. Please set OUTLINE_API_TOKEN."
 
         try:
             # 1. Search documents in Outline
