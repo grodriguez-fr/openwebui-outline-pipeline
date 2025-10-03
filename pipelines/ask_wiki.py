@@ -1,71 +1,95 @@
-import requests
+"""
+title: Ask Wiki
+author: JECT
+date: 2025-10-03
+version: 1.0
+license: MIT
+description: A pipeline to query Outline (wiki) and retrieve answers from collections and documents.
+requirements: requests
+"""
+
 import os
+import requests
+from typing import List, Union, Generator, Iterator
 
-OUTLINE_API_BASE = os.getenv("OUTLINE_API_BASE")
-OUTLINE_API_TOKEN = os.getenv("OUTLINE_API_TOKEN")
 
-def _headers():
-    return {"Authorization": f"Bearer {OUTLINE_API_TOKEN}"}
+class Pipeline:
+    def __init__(self):
+        self.api_base = None
+        self.api_token = None
 
-def ask_wiki(query: str) -> str:
-    """
-    Answer a natural language question by navigating Outline (wiki).
-    Steps:
-      1. Get collections
-      2. Identify relevant collections
-      3. List documents from those collections
-      4. Retrieve content of matching documents
-      5. Return a synthesized answer
-    """
-    try:
-        # Step 1: get collections
-        url_col = f"{OUTLINE_API_BASE}/collections.list"
-        r = requests.post(url_col, headers=_headers())
-        r.raise_for_status()
-        collections = r.json().get("data", [])
+    async def on_startup(self):
+        # Called when pipeline starts
+        self.api_base = os.getenv("OUTLINE_API_BASE", "https://wiki.ject.fr/api")
+        self.api_token = os.getenv("OUTLINE_API_TOKEN", "")
 
-        # Step 2: filter relevant collections
-        target_colls = [
-            c for c in collections if query.lower() in c.get("name", "").lower()
-        ]
-        if not target_colls:
-            target_colls = collections
+    async def on_shutdown(self):
+        # Called when pipeline stops
+        self.api_base = None
+        self.api_token = None
 
-        response_parts = []
+    def _headers(self):
+        return {"Authorization": f"Bearer {self.api_token}"}
 
-        # Step 3 & 4: loop through collections and documents
-        for coll in target_colls[:3]:  # limit to 3 collections
-            col_name = coll.get("name", "[No name]")
-            col_id = coll.get("id", "?")
+    def pipe(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> Union[str, Generator, Iterator]:
+        """
+        Main pipeline logic:
+          1. Fetch collections
+          2. Identify relevant collections
+          3. List documents in them
+          4. Retrieve document content
+          5. Return excerpts as an answer
+        """
 
-            url_docs = f"{OUTLINE_API_BASE}/collections.documents"
-            r2 = requests.post(url_docs, headers=_headers(), json={"id": col_id})
-            r2.raise_for_status()
-            docs = r2.json().get("data", [])
+        try:
+            # Step 1: get collections
+            url_col = f"{self.api_base}/collections.list"
+            r = requests.post(url_col, headers=self._headers())
+            r.raise_for_status()
+            collections = r.json().get("data", [])
 
-            matching_docs = [
-                d for d in docs if query.lower() in d.get("title", "").lower()
-            ] or docs[:3]
+            # Step 2: filter collections
+            query = user_message
+            target_colls = [
+                c for c in collections if query.lower() in c.get("name", "").lower()
+            ]
+            if not target_colls:
+                target_colls = collections
 
-            for doc in matching_docs:
-                doc_id = doc.get("id")
-                doc_title = doc.get("title", "[Untitled]")
+            response_parts = []
 
-                # Step 5: get document content
-                url_info = f"{OUTLINE_API_BASE}/documents.info"
-                r3 = requests.post(url_info, headers=_headers(), json={"id": doc_id})
-                r3.raise_for_status()
-                doc_data = r3.json().get("data", {})
+            # Step 3 & 4: documents in collections
+            for coll in target_colls[:3]:
+                col_id = coll.get("id", "?")
+                url_docs = f"{self.api_base}/collections.documents"
+                r2 = requests.post(url_docs, headers=self._headers(), json={"id": col_id})
+                r2.raise_for_status()
+                docs = r2.json().get("data", [])
 
-                text = doc_data.get("text", "[empty]")[:600]  # truncate
-                response_parts.append(f"### {doc_title}\n{text}...\n")
+                matching_docs = [
+                    d for d in docs if query.lower() in d.get("title", "").lower()
+                ] or docs[:3]
 
-        return (
-            f"📚 Results for query: *{query}*\n\n" +
-            "\n".join(response_parts)
-            if response_parts
-            else f"No documents found for '{query}'."
-        )
+                for doc in matching_docs:
+                    doc_id = doc.get("id")
+                    doc_title = doc.get("title", "[Untitled]")
 
-    except Exception as e:
-        return f"Error while querying wiki: {e}"
+                    # Step 5: get content
+                    url_info = f"{self.api_base}/documents.info"
+                    r3 = requests.post(url_info, headers=self._headers(), json={"id": doc_id})
+                    r3.raise_for_status()
+                    doc_data = r3.json().get("data", {})
+
+                    text = doc_data.get("text", "[empty]")[:600]
+                    response_parts.append(f"### {doc_title}\n{text}...\n")
+
+            return (
+                f"📚 Results for query: *{query}*\n\n" + "\n".join(response_parts)
+                if response_parts
+                else f"No documents found for '{query}'."
+            )
+
+        except Exception as e:
+            return f"Error while querying wiki: {e}"
