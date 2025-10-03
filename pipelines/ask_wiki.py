@@ -64,8 +64,12 @@ class Pipeline:
             r = requests.post(
                 f"{self.valves.OUTLINE_API_BASE}/documents.search",
                 headers=self._headers(),
-                json={"query": user_message},
+                json={
+                    "query": user_message,
+                    "includeArchived": False
+                },
             )
+
             r.raise_for_status()
             docs = r.json().get("data", [])
 
