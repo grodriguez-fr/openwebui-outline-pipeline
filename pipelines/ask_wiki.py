@@ -28,7 +28,7 @@ class Pipeline:
             default=os.getenv("OUTLINE_API_TOKEN", ""),
             description="API token for Outline",
         )
-        WORD_LIMIT: int = Field(default=500, description="Limit words per document excerpt")
+        # Removed WORD_LIMIT to return full Markdown content
 
     def __init__(self):
         self.name = "Outline Wiki Pipeline"
@@ -53,7 +53,7 @@ class Pipeline:
         body: dict
     ) -> Union[str, Generator, Iterator]:
         """
-        Main pipeline logic: search for documents in Outline by query and return excerpts.
+        Main pipeline logic: search for documents in Outline by query and return full Markdown content.
         """
         logger.info(f"User Message: {user_message}")
         streaming = body.get("stream", False)
@@ -84,7 +84,7 @@ class Pipeline:
                 doc_id = doc.get("document", {}).get("id")
                 doc_title = doc.get("document", {}).get("title", "[Untitled]")
 
-                # 2. Get document content
+                # 2. Get document content (Markdown)
                 r = requests.post(
                     f"{self.valves.OUTLINE_API_BASE}/documents.info",
                     headers=self._headers(),
@@ -92,12 +92,10 @@ class Pipeline:
                 )
                 r.raise_for_status()
                 doc_data = r.json().get("data", {})
-                text = doc_data.get("text", "[empty]")
+                # Outline returns Markdown in the 'text' field
+                markdown_text = doc_data.get("text", "[empty]")
 
-                excerpt = text.split()[:self.valves.WORD_LIMIT]
-                excerpt_text = " ".join(excerpt) + ("..." if len(excerpt) >= self.valves.WORD_LIMIT else "")
-
-                chunk = f"## {doc_title}\n\n{excerpt_text}\n"
+                chunk = f"## {doc_title}\n\n{markdown_text}\n"
 
                 if streaming:
                     yield chunk
