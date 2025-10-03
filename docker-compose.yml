@@ -1,0 +1,14 @@
+services:
+  pipelines:
+    image: ghcr.io/open-webui/pipelines:main
+    ports:
+      - 127.0.0.1:9099:9099
+    volumes:
+      - ./pipelines:/app/pipelines
+    environment:
+      PORT: 9099
+      PIPELINES_AUTO_IMPORT: true
+      OUTLINE_API_BASE: "https://wiki.ject.fr/api"
+      OUTLINE_API_TOKEN: "your_outline_api_token_here"
+
+volumes: {}
