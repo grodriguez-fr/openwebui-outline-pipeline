@@ -4,119 +4,142 @@ author: JECT
 date: 2025-10-03
 version: 1.0
 license: MIT
-description: A pipeline to query an Outline wiki (e.g., wiki.ject.fr) and return relevant documents.
-requirements: requests
+description: A pipeline pour interroger le wiki Outline (wiki.ject.fr) et récupérer des documents pertinents.
+requirements: requests, pydantic
 """
 
-from typing import List, Union, Iterator
-from pydantic import BaseModel, Field
-import requests
 import os
+import requests
+from typing import Iterator, Union, List
+from pydantic import BaseModel, Field
 from logging import getLogger
+
+from pipelines import Pipeline, Message
 
 logger = getLogger(__name__)
 logger.setLevel("DEBUG")
 
 
-class Pipeline:
+# -------------------------------------------------------------------------
+# Tools encapsulant l’API Outline
+# -------------------------------------------------------------------------
+class OutlineTools:
     class Valves(BaseModel):
-        OUTLINE_API_BASE: str = Field(
+        outline_api_base: str = Field(
             default=os.getenv("OUTLINE_API_BASE", "https://wiki.ject.fr/api"),
-            description="Base URL for Outline API",
+            description="URL de base de l'API Outline",
         )
-        OUTLINE_API_TOKEN: str = Field(
+        outline_api_token: str = Field(
             default=os.getenv("OUTLINE_API_TOKEN", ""),
-            description="API token for Outline",
+            description="Token API Outline",
         )
 
     def __init__(self):
-        self.name = "Outline Wiki Pipeline"
-        self.valves = self.Valves(
-            **{k: os.getenv(k, v.default) for k, v in self.Valves.model_fields.items()}
+        self.valves = self.Valves()
+
+    def _headers(self):
+        return {"Authorization": f"Bearer {self.valves.outline_api_token}"}
+
+    def list_collections(self) -> str:
+        url = f"{self.valves.outline_api_base}/collections.list"
+        try:
+            r = requests.post(url, headers=self._headers())
+            r.raise_for_status()
+            data = r.json()
+            return "\n".join(
+                [f"{c.get('name','[Sans nom]')} (id={c.get('id')})" for c in data.get("data", [])]
+            ) or "Aucune collection trouvée."
+        except Exception as e:
+            return f"Erreur list_collections: {e}"
+
+    def list_collection_docs(self, collection_id: str) -> str:
+        url = f"{self.valves.outline_api_base}/collections.documents"
+        try:
+            r = requests.post(url, headers=self._headers(), json={"id": collection_id})
+            r.raise_for_status()
+            data = r.json()
+            return "\n".join(
+                [f"{d.get('title','[Sans titre]')} (id={d.get('id')})" for d in data.get("data", [])][:20]
+            ) or f"Aucun document trouvé dans {collection_id}."
+        except Exception as e:
+            return f"Erreur list_collection_docs: {e}"
+
+    def search_docs(self, query: str) -> str:
+        url = f"{self.valves.outline_api_base}/documents.search"
+        try:
+            r = requests.post(url, headers=self._headers(), json={"query": query})
+            r.raise_for_status()
+            data = r.json()
+            return "\n".join(
+                [f"{d.get('document',{}).get('title','[Sans titre]')} (id={d.get('document',{}).get('id')})"
+                 for d in data.get("data", [])][:5]
+            ) or "Aucun résultat."
+        except Exception as e:
+            return f"Erreur search_docs: {e}"
+
+    def get_doc(self, doc_id: str) -> str:
+        url = f"{self.valves.outline_api_base}/documents.info"
+        try:
+            r = requests.post(url, headers=self._headers(), json={"id": doc_id})
+            r.raise_for_status()
+            data = r.json()
+            title = data.get("data", {}).get("title", "Sans titre")
+            text = data.get("data", {}).get("text", "[vide]")
+            return f"# {title}\n\n{text[:1000]}..."
+        except Exception as e:
+            return f"Erreur get_doc: {e}"
+
+
+# -------------------------------------------------------------------------
+# Pipeline OpenWebUI
+# -------------------------------------------------------------------------
+class OutlineWikiPipeline(Pipeline):
+    class Valves(BaseModel):
+        OUTLINE_API_BASE: str = Field(
+            default=os.getenv("OUTLINE_API_BASE", "https://wiki.ject.fr/api"),
+            description="Base URL de l’API Outline",
+        )
+        OUTLINE_API_TOKEN: str = Field(
+            default=os.getenv("OUTLINE_API_TOKEN", ""),
+            description="Clé API Outline",
         )
 
-    async def on_startup(self):
-        logger.debug(f"on_startup:{self.name}")
+    def __init__(self):
+        super().__init__()
+        self.name = "Outline Wiki Pipeline"
+        self.valves = self.Valves()
+        self.tools = OutlineTools()
 
-    async def on_shutdown(self):
-        logger.debug(f"on_shutdown:{self.name}")
+    def on_startup(self, ctx):
+        logger.info("✅ OutlineWikiPipeline initialisée avec %s", self.valves.OUTLINE_API_BASE)
 
-    def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.valves.OUTLINE_API_TOKEN}"}
+    def on_shutdown(self, ctx):
+        logger.info("🛑 OutlineWikiPipeline arrêtée")
 
-    def pipe(
-        self,
-        user_message: str,
-        model_id: str,
-        messages: List[dict],
-        body: dict
-    ) -> Union[str, Iterator[str]]:
-        """
-        Main pipeline logic: search for documents in Outline by query and return content.
-        - If streaming: yield Markdown chunks as they are retrieved.
-        - If not streaming: accumulate results and return a prompt asking the LLM to answer the user question.
-        """
-        logger.info(f"User Message: {user_message}")
-        streaming = body.get("stream", False)
+    def invoke(self, messages: List[Message], stream: bool = False) -> Union[Iterator[Message], Message]:
+        last = messages[-1]
+        text = last.content.strip()
 
-        # Validate token early
-        if not self.valves.OUTLINE_API_TOKEN:
-            return "Outline API token is missing. Please set OUTLINE_API_TOKEN."
+        logger.debug("➡️ Reçu: %s", text)
 
-        def generate() -> Iterator[str]:
-            try:
-                # 1. Search documents in Outline
-                r = requests.post(
-                    f"{self.valves.OUTLINE_API_BASE}/documents.search",
-                    headers=self._headers(),
-                    json={"query": user_message, "includeArchived": False},
-                    timeout=15,
-                )
-                r.raise_for_status()
-                docs = r.json().get("data", [])
-
-                if not docs:
-                    yield f"No documents found for '{user_message}'"
-                    return
-
-                multi_part = False
-                for doc in docs[:3]:  # limit to 3 docs
-                    if multi_part:
-                        yield "---\n"
-
-                    doc_id = doc.get("document", {}).get("id")
-                    doc_title = doc.get("document", {}).get("title", "[Untitled]")
-
-                    # 2. Get document content
-                    r_info = requests.post(
-                        f"{self.valves.OUTLINE_API_BASE}/documents.info",
-                        headers=self._headers(),
-                        json={"id": doc_id},
-                        timeout=15,
-                    )
-                    r_info.raise_for_status()
-                    doc_data = r_info.json().get("data", {})
-                    markdown_text = doc_data.get("text", "[empty]")
-
-                    yield f"## {doc_title}\n\n{markdown_text}\n"
-                    multi_part = True
-
-            except Exception as e:
-                logger.error(f"Pipeline error: {e}")
-                yield f"Error while querying Outline: {e}"
-
-        if streaming:
-            # mode streaming -> renvoie le générateur tel quel
-            return generate()
+        if text.startswith("/collections"):
+            result = self.tools.list_collections()
+        elif text.startswith("/docs "):
+            collection_id = text.split(" ", 1)[1]
+            result = self.tools.list_collection_docs(collection_id)
+        elif text.startswith("/search "):
+            query = text.split(" ", 1)[1]
+            result = self.tools.search_docs(query)
+        elif text.startswith("/get "):
+            doc_id = text.split(" ", 1)[1]
+            result = self.tools.get_doc(doc_id)
         else:
-            # mode non-streaming -> accumule et contextualise
-            context = "".join(generate())
-            if context.strip():
-                return (
-                    f"The following information was retrieved from the Outline wiki:\n\n"
-                    f"{context}\n\n"
-                    f"Using this information, please answer the question:\n"
-                    f"{user_message}"
-                )
-            else:
-                return "No relevant content"
+            result = (
+                "❓ Commandes disponibles:\n"
+                "/collections → Liste les collections\n"
+                "/docs <collection_id> → Liste les docs d’une collection\n"
+                "/search <mot-clé> → Recherche de documents\n"
+                "/get <doc_id> → Récupère le contenu d’un document"
+            )
+
+        return Message(role="assistant", content=result)
